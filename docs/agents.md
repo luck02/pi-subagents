@@ -336,7 +336,7 @@ A container runner sits in its own pid namespace, where it is usually pid 1, so 
 {
   "runnerLaunchers": {
     "podman": {
-      "argv": ["podman", "run", "--rm", "--name", "{name}", "--memory=8g", "-e", "PI_*", "-e", "JITI_ALIAS", "-e", "HOME", "-e", "PATH", "-e", "TMPDIR", "-v", "...", "my-runner-image"],
+      "argv": ["podman", "run", "--rm", "--name", "{name}", "--memory=8g", "-e", "PI_*", "-e", "JITI_ALIAS", "-e", "HOME", "-e", "PATH", "-e", "PI_SUBAGENTS_TEMP_ROOT=/tmp/pi-subagents-uid-1000", "-v", "...", "my-runner-image"],
       "container": {
         "name": "pi-run-{runId}",
         "stop": ["podman", "rm", "-f", "-i", "-t", "5", "{name}"],
@@ -353,7 +353,7 @@ A container runner sits in its own pid namespace, where it is usually pid 1, so 
 - A parent that did not see the launcher exit, for example one started after the container died, finds the run through the stale-run check: it runs `probe` at most every 30 seconds per run and fails the run once the container is gone. The abandoned-slot policy uses the same probe instead of the runner's pid.
 - Plain argv launchers keep the behaviour described under Broker wrappers.
 
-Podman and Docker filter the environment, so pass through what the wrapper requirements above list; `-e 'PI_*'` forwards every `PI_` variable. Without `PI_PACKAGE_DIR` and `JITI_ALIAS` the runner cannot find the parent's Pi and may load a different copy from the mounted paths. On SELinux hosts, label shared mounts with `:z`, not `:Z`: `:Z` relabels the directory for each new container and locks out the containers already running.
+Podman and Docker filter the environment, so pass through what the wrapper requirements above list; `-e 'PI_*'` forwards every `PI_` variable. Set the subagent temp root explicitly with `-e PI_SUBAGENTS_TEMP_ROOT=<the mounted path>` instead of forwarding `TMPDIR`: when the host has no `TMPDIR`, podman's `-e TMPDIR` sets it to `/var/tmp` inside the container, and the runner then looks for its run files in a directory the parent never writes. Without `PI_PACKAGE_DIR` and `JITI_ALIAS` the runner cannot find the parent's Pi and may load a different copy from the mounted paths. On SELinux hosts, label shared mounts with `:z`, not `:Z`: `:Z` relabels the directory for each new container and locks out the containers already running.
 
 ### Limits
 

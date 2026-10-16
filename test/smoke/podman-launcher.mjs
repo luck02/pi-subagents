@@ -59,9 +59,9 @@ function launcherArgv(variant, name, stage) {
 	// legacy: the shape of the podman8g launcher on 2026-10-15 (own pid namespace, no env passthrough).
 	if (variant === "legacy") return [...common, "-e", `HOME=${path.join(stage, "home")}`, "-e", `SMOKE_STAGE=${stage}`, "-e", `PI_CODING_AGENT_DIR=${path.join(stage, "agent")}`, "-e", `PI_SUBAGENTS_TEMP_ROOT=${path.join(stage, "tmproot")}`, image];
 	// host-pid: share the host pid namespace and hostname, and pass the runner env through as docs/agents.md requires.
-	if (variant === "host-pid") return [...common, "--pid=host", "--uts=host", "-e", "PI_*", "-e", "JITI_ALIAS", "-e", "HOME", "-e", "PATH", "-e", "TMPDIR", "-e", "SMOKE_STAGE", image];
+	if (variant === "host-pid") return [...common, "--pid=host", "--uts=host", "-e", "PI_*", "-e", "JITI_ALIAS", "-e", "HOME", "-e", "PATH", "-e", "SMOKE_STAGE", image];
 	// container: own pid namespace, env passed through, and pi-subagents' container mode tracks the container by name.
-	if (variant === "container") return [...common.map((arg) => arg === name ? "{name}" : arg), "-e", "PI_*", "-e", "JITI_ALIAS", "-e", "HOME", "-e", "PATH", "-e", "TMPDIR", "-e", "SMOKE_STAGE", image];
+	if (variant === "container") return [...common.map((arg) => arg === name ? "{name}" : arg), "-e", "PI_*", "-e", "JITI_ALIAS", "-e", "HOME", "-e", "PATH", "-e", "SMOKE_STAGE", image];
 	throw new Error(`unknown variant ${variant}`);
 }
 
