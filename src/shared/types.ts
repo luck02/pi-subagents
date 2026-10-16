@@ -707,6 +707,8 @@ export type ProcessTerminal =
 		observedAt: number;
 		instances: ProcessInstanceExit[];
 		canonicalSession?: CanonicalSessionTerminal;
+		/** Name of the runner's container, removed and confirmed gone before this proof was written. */
+		removedContainer?: string;
 	})
 	| (ProcessTerminalBase & {
 		state: "unknown";
@@ -2431,9 +2433,22 @@ export const SUBAGENT_ASYNC_STARTED_EVENT = "subagent:async-started";
 /** Launcher names are plain identifiers so they survive frontmatter rewrites without quoting. */
 export const RUNNER_LAUNCHER_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 export const RUNNER_LAUNCHER_NAME_RULE = "must start with a letter or digit and use only letters, digits, '.', '_' or '-' (at most 128 characters)";
+/**
+ * A container launcher's runner shares no pid namespace with the parent, so its death is
+ * read from the container engine: `stop` removes the container, `probe` exits 0 while it
+ * exists and 1 once it is gone. `{runId}` and `{name}` are bound per run.
+ */
+export interface RunnerLauncherContainer {
+	name: string;
+	stop: string[];
+	probe: string[];
+}
+/** A `runnerLaunchers` entry: a plain argv prefix, or an argv with container lifecycle commands. */
+export type RunnerLauncherConfig = string[] | { argv: string[]; container?: RunnerLauncherContainer };
 export interface RunnerLauncher {
 	name: string;
 	argv: string[];
+	container?: RunnerLauncherContainer;
 }
 export const SUBAGENT_ASYNC_COMPLETE_EVENT = "subagent:async-complete";
 export const SUBAGENT_PROCESS_TERMINAL_EVENT = "subagent:process-terminal";
@@ -2709,7 +2724,7 @@ export interface ExtensionConfig {
 	/** Exact provider/model candidates mapped to operator-declared equivalent response IDs. Empty arrays add no accepted IDs. */
 	modelResponseAliases?: Record<string, string[]>;
 	/** Named argv prefixes for background runners; agents select one with `launcher: <name>`. User config only. */
-	runnerLaunchers?: Record<string, string[]>;
+	runnerLaunchers?: Record<string, RunnerLauncherConfig>;
 	/** Tool description variant registered for the parent-facing subagent tool. Defaults to split metadata. */
 	toolDescriptionMode?: ToolDescriptionMode;
 	/** How a new parent session offers the subagent tool. Defaults to auto. */

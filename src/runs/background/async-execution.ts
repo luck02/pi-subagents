@@ -85,8 +85,9 @@ import type { ActiveAsyncCapacityHandle } from "./active-async-capacity.ts";
 import { statusStepDescription } from "./chain-append.ts";
 import { currentPidNamespaceScope } from "./pid-namespace.ts";
 import { checkPidLiveness } from "./stale-run-reconciler.ts";
-import { lookupRunnerLauncher, resolveAgentRunnerLauncher, runnerLauncherPlacementError } from "../shared/runner-launcher.ts";
-import { SUBAGENT_PROCESS_TERMINAL_EVENT, type RunnerLauncher } from "../../shared/types.ts";
+import { removeRunnerContainer } from "./container-runner.ts";
+import { bindRunnerLauncherToRun, lookupRunnerLauncher, resolveAgentRunnerLauncher, runnerLauncherPlacementError } from "../shared/runner-launcher.ts";
+import { SUBAGENT_PROCESS_TERMINAL_EVENT, type RunnerLauncher, type RunnerLauncherConfig } from "../../shared/types.ts";
 import { assertAgentAllowedByCapabilityCeiling, intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling, type ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
 import { resolveLaunchBinding } from "../../shared/launch-contract.ts";
 import { resolvePermissionRules, type PermissionConfig } from "../shared/permissions.ts";
@@ -192,7 +193,7 @@ interface AsyncExecutionContext {
 	/** Whether the parent session has an interactive UI. */
 	interactive?: boolean;
 	/** User-configured runner launchers; an agent's `launcher` must name one of them. */
-	runnerLaunchers?: Record<string, string[]>;
+	runnerLaunchers?: Record<string, RunnerLauncherConfig>;
 	/** The executor's own child runtime when the launch comes from an in-process child. */
 	childRuntime?: ChildRuntimeConfig;
 	/** The launching session's project trust; undefined when the host has no trust concept. */
@@ -736,9 +737,15 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 	if (identityPath) fs.rmSync(identityPath, { force: true });
 	let runnerIdentity: { pid: number; pidNamespaceScope?: string } | undefined;
 	// Wrapper exit is not runner exit, so only a reported runner in this namespace may be signalled.
-	const terminateBeforeProceed = (pid: number): boolean => !launcher
-		? terminateRunnerBeforeProceed(pid)
-		: runnerIdentity !== undefined && runnerIdentity.pidNamespaceScope === currentPidNamespaceScope() && terminateRunnerBeforeProceed(runnerIdentity.pid);
+	const terminateBeforeProceed = (pid: number): boolean => {
+		if (!launcher) return terminateRunnerBeforeProceed(pid);
+		// A container runner cannot be signalled from here; removing its container ends it. The close handler records the outcome.
+		if (launcher.container) {
+			void removeRunnerContainer(launcher.container);
+			return false;
+		}
+		return runnerIdentity !== undefined && runnerIdentity.pidNamespaceScope === currentPidNamespaceScope() && terminateRunnerBeforeProceed(runnerIdentity.pid);
+	};
 	const adoptRunnerIdentity = (pid: unknown, pidNamespaceScope: unknown): string | undefined => {
 		if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid < 1) return `Async runner reported an invalid process identity in '${launchAsyncDir}'.`;
 		runnerIdentity = { pid, ...(typeof pidNamespaceScope === "string" ? { pidNamespaceScope } : {}) };
@@ -804,27 +811,14 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 			console.error(`[pi-subagents] async spawn failed: ${error.message}`);
 		});
 		proc.once("close", (exitCode, signal) => {
-			const finalize = () => {
-				const launch = launchConfig as { asyncDir?: unknown; id?: unknown; nestedRoute?: NestedRouteInfo; nestedSelf?: { parentRunId: string; parentStepIndex?: number; depth: number; path?: Array<{ runId: string; stepIndex?: number; agent?: string }> } };
-			const asyncDir = launch.asyncDir;
-			const runId = launch.id;
-			if (typeof asyncDir !== "string" || typeof runId !== "string") return;
-			if (launcher) {
-				try {
-					writePrivateAtomicJson(path.join(asyncDir, "launcher-close.json"), { version: 1, runId, runnerProcessInstanceId, closeObservedAt: Date.now(), exitCode, signal, ...(runnerIdentity ? { runnerPid: runnerIdentity.pid } : {}) });
-				} catch {
-					// Diagnostic only; process-terminal proof stays authoritative.
-				}
-				// The runner may outlive its wrapper; only a confirmed-dead runner in this pid namespace finalizes here,
-				// otherwise status-pid reconciliation does it later.
-				if (!runnerIdentity || runnerIdentity.pidNamespaceScope !== currentPidNamespaceScope() || checkPidLiveness(runnerIdentity.pid, process.kill, runnerIdentity.pidNamespaceScope !== undefined) !== "dead") return;
-			}
+			// Publish the runner's exit once it is known: proof sidecar, nested parent event, terminal hook.
+			const publishRunnerTerminal = (asyncDir: string, runId: string, launch: { nestedRoute?: NestedRouteInfo; nestedSelf?: { parentRunId: string; parentStepIndex?: number; depth: number; path?: Array<{ runId: string; stepIndex?: number; agent?: string }> } }, closeObservedAt: number, removedContainer?: string) => {
 			finalizeProcessTerminal(asyncDir, runId, {
 				processInstanceId: runnerProcessInstanceId,
-				closeObservedAt: Date.now(),
+				closeObservedAt,
 				exitCode,
 				signal,
-			});
+			}, removedContainer ? { removedContainer } : undefined);
 			const persisted = readProcessTerminal(asyncDir, { runId, runnerProcessInstanceId });
 			if (!persisted) return;
 			if (launch.nestedRoute && launch.nestedSelf) {
@@ -863,6 +857,39 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 				}
 			}
 			onProcessTerminal?.(persisted);
+			};
+			const finalize = () => {
+				const launch = launchConfig as { asyncDir?: unknown; id?: unknown; nestedRoute?: NestedRouteInfo; nestedSelf?: { parentRunId: string; parentStepIndex?: number; depth: number; path?: Array<{ runId: string; stepIndex?: number; agent?: string }> } };
+			const asyncDir = launch.asyncDir;
+			const runId = launch.id;
+			if (typeof asyncDir !== "string" || typeof runId !== "string") return;
+			const closeRecord = { version: 1, runId, runnerProcessInstanceId, closeObservedAt: Date.now(), exitCode, signal, ...(runnerIdentity ? { runnerPid: runnerIdentity.pid } : {}) };
+			if (launcher) {
+				try {
+					writePrivateAtomicJson(path.join(asyncDir, "launcher-close.json"), closeRecord);
+				} catch {
+					// Diagnostic only; process-terminal proof stays authoritative.
+				}
+				// A container runner has its own pid namespace, so its pid says nothing here. The launcher
+				// closing is not enough either: a killed `podman run` client leaves the container running.
+				// Remove the container, and publish the runner's exit once the probe confirms it is gone.
+				const container = launcher.container;
+				if (container) {
+					void removeRunnerContainer(container).then((removal) => {
+						try {
+							writePrivateAtomicJson(path.join(asyncDir, "launcher-close.json"), { ...closeRecord, container: { name: container.name, ...removal } });
+						} catch {
+							// Diagnostic only.
+						}
+						if (removal.removed) publishRunnerTerminal(asyncDir, runId, launch, closeRecord.closeObservedAt, container.name);
+					});
+					return;
+				}
+				// The runner may outlive its wrapper; only a confirmed-dead runner in this pid namespace finalizes here,
+				// otherwise status-pid reconciliation does it later.
+				if (!runnerIdentity || runnerIdentity.pidNamespaceScope !== currentPidNamespaceScope() || checkPidLiveness(runnerIdentity.pid, process.kill, runnerIdentity.pidNamespaceScope !== undefined) !== "dead") return;
+			}
+			publishRunnerTerminal(asyncDir, runId, launch, Date.now());
 			};
 			if (startupPath) setImmediate(finalize);
 			else finalize();
@@ -1571,7 +1598,8 @@ export function executeAsyncChain(
 		return formatAsyncStartError(resultMode, built.error);
 	}
 	const { steps, runnerCwd, workflowGraph, eventChain } = built;
-	const launcher = built.launcher === undefined ? undefined : lookupRunnerLauncher(ctx.runnerLaunchers, built.launcher);
+	const configuredLauncher = built.launcher === undefined ? undefined : lookupRunnerLauncher(ctx.runnerLaunchers, built.launcher);
+	const launcher = configuredLauncher && bindRunnerLauncherToRun(configuredLauncher, id);
 	const deadlineAt = params.timeoutMs !== undefined ? Date.now() + params.timeoutMs : undefined;
 	const initialUsageBudget = usageBudgetState(params.usageBudget, undefined);
 	let childTargetIndex = 0;
@@ -1900,7 +1928,7 @@ export function executeAsyncSingle(
 	if (machineUnsupported) return formatAsyncStartError("single", machineUnsupported);
 	const resolvedLauncher = resolveAgentRunnerLauncher(agentConfig, ctx.runnerLaunchers, requestedMachine);
 	if (resolvedLauncher.error) return formatAsyncStartError("single", resolvedLauncher.error);
-	const launcher = resolvedLauncher.launcher;
+	const launcher = resolvedLauncher.launcher && bindRunnerLauncherToRun(resolvedLauncher.launcher, id);
 	const registeredExtensions = resolveRequiredChildExtensions(ctx.parentSessionId ?? ctx.currentSessionId ?? undefined);
 	try {
 		assertRequiredChildExtensionsAdmitted([params.requiredExtensions, ctx.childRuntime?.requiredExtensions, registeredExtensions], { agent: agentConfig.name, runnerType: agentConfig.runner?.type, machine: requestedMachine });

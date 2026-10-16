@@ -153,6 +153,13 @@ export function finalizeProcessTerminal(
 	asyncDir: string,
 	runId: string,
 	runnerClose: RunnerCloseObservation,
+	options?: {
+		/**
+		 * The runner's container was removed and confirmed gone. Every writer process ran inside it,
+		 * so their exits follow from the removal even when the runner died before recording them.
+		 */
+		removedContainer?: string;
+	},
 ): ProcessTerminal {
 	const existing = readProcessTerminal(asyncDir, { runId, runnerProcessInstanceId: runnerClose.processInstanceId });
 	if (existing && fs.existsSync(processTerminalPath(asyncDir))) {
@@ -193,9 +200,9 @@ export function finalizeProcessTerminal(
 				proof = unknownProof(runId, runnerClose.processInstanceId, session.state === "owned" ? "canonical-session-lease-active" : "canonical-session-unavailable");
 			} else if (candidate.revivalLeaseToken && candidate.revivalLeaseReleaseAcknowledged !== true) {
 				proof = unknownProof(runId, runnerClose.processInstanceId, "canonical-session-release-unverified");
-			} else if (inconsistentWriters || (allWriters.length === 0 && expectedEntries.length === 0)) {
+			} else if (!options?.removedContainer && (inconsistentWriters || (allWriters.length === 0 && expectedEntries.length === 0))) {
 				proof = unknownProof(runId, runnerClose.processInstanceId, "writer-close-unverified");
-			} else if (allWriters.some((writer) => writer.kind === "pi-writer" && writer.processTree.state !== "observed")) {
+			} else if (!options?.removedContainer && allWriters.some((writer) => writer.kind === "pi-writer" && writer.processTree.state !== "observed")) {
 				proof = unknownProof(runId, runnerClose.processInstanceId, "process-tree-unverified");
 			} else {
 				const runner: ProcessInstanceExit = { kind: "runner", ...runnerClose };
@@ -209,6 +216,7 @@ export function finalizeProcessTerminal(
 					instances: [runner, ...allWriters],
 					resumeDisposition: resumeDisposition(status?.state, candidate.sessionFile ?? status?.sessionFile),
 					...(canonicalSession ? { canonicalSession } : {}),
+					...(options?.removedContainer ? { removedContainer: options.removedContainer } : {}),
 				};
 			}
 		}

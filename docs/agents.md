@@ -328,6 +328,33 @@ Some sandboxes, such as nono's broker mode, start the runner in a separate proce
 - If the sandbox does not let the parent check the runner's process id, a runner that dies without its launcher noticing stays `running` until the stale-run check marks it failed after 24 hours without a status update.
 - A broker may end the runner when the broker's own session ends, so background runs under such a launcher may not outlive the Pi session.
 
+### Container launchers
+
+A container runner sits in its own pid namespace, where it is usually pid 1, so the parent cannot see its process die. A killed `podman run` or `docker run` client also leaves the container running under the engine's monitor, so the launcher's exit does not prove the runner stopped. Give such a launcher the commands that track the container instead of its process:
+
+```json
+{
+  "runnerLaunchers": {
+    "podman": {
+      "argv": ["podman", "run", "--rm", "--name", "{name}", "--memory=8g", "-e", "PI_*", "-e", "JITI_ALIAS", "-e", "HOME", "-e", "PATH", "-e", "TMPDIR", "-v", "...", "my-runner-image"],
+      "container": {
+        "name": "pi-run-{runId}",
+        "stop": ["podman", "rm", "-f", "-i", "-t", "5", "{name}"],
+        "probe": ["podman", "container", "exists", "{name}"]
+      }
+    }
+  }
+}
+```
+
+- `{runId}` and `{name}` are replaced per run in `argv`, `stop` and `probe`; `name` must contain `{runId}` and `argv` must start the container under `{name}`.
+- `probe` must exit `0` while the container exists and `1` once it is gone. Any other exit, or a probe that takes longer than 5 seconds, counts as unknown.
+- **The launcher's exit ends the run.** When the launcher process exits for any reason, including a killed client, pi-subagents runs `stop` and then `probe`. Once the probe says the container is gone, the runner's exit is recorded as observed, the run is marked failed unless it already wrote a result, the parent is notified and the capacity slot is released. Every process the runner started was inside the container, so their exits follow from its removal. `launcher-close.json` records both commands' results.
+- A parent that did not see the launcher exit, for example one started after the container died, finds the run through the stale-run check: it runs `probe` at most every 30 seconds per run and fails the run once the container is gone. The abandoned-slot policy uses the same probe instead of the runner's pid.
+- Plain argv launchers keep the behaviour described under Broker wrappers.
+
+Podman and Docker filter the environment, so pass through what the wrapper requirements above list; `-e 'PI_*'` forwards every `PI_` variable. Without `PI_PACKAGE_DIR` and `JITI_ALIAS` the runner cannot find the parent's Pi and may load a different copy from the mounted paths. On SELinux hosts, label shared mounts with `:z`, not `:Z`: `:Z` relabels the directory for each new container and locks out the containers already running.
+
 ### Limits
 
 - A launcher controls where the child runs, not where its output goes. Results, transcripts, and files the child writes in shared directories are visible to the parent as usual.

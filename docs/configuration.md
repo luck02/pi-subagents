@@ -249,6 +249,7 @@ Named command prefixes that wrap a background runner, for example to run some ag
 - This key is read only from this user config file. Project settings, agent files, and tool calls cannot define a launcher command; an agent file can only name one defined here.
 - Names must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`.
 - Each value is a non-empty array of non-blank strings without NUL characters. It is passed to the operating system as an argument list, never through a shell, so quoting and whitespace inside an entry are kept as written.
+- A value can instead be `{ "argv": [...], "container": { "name", "stop", "probe" } }` for a launcher that runs the runner in a container. See [Container launchers](agents.md#container-launchers).
 - An invalid entry makes config loading fail with an error instead of falling back to defaults. If the file is not valid JSON at all, no launchers are defined, so every agent that names a launcher fails to launch.
 
 See [Sandboxing background children with a launcher](agents.md#sandboxing-background-children-with-a-launcher) for the agent field, the requirements a wrapper must meet, and its limits.

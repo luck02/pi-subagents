@@ -103,14 +103,33 @@ function validateCapacityConfig(value: unknown): void {
 	}
 }
 
+function isLauncherArgv(value: unknown): value is string[] {
+	return Array.isArray(value) && value.length > 0 && value.every((arg) => typeof arg === "string" && arg.trim() !== "" && !arg.includes("\u0000"));
+}
+
 function validateRunnerLaunchersConfig(value: unknown): void {
 	if (value === undefined) return;
-	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("config.runnerLaunchers must be a JSON object mapping launcher names to argv arrays");
-	for (const [name, argv] of Object.entries(value)) {
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("config.runnerLaunchers must be a JSON object mapping launcher names to argv arrays or { argv, container } objects");
+	for (const [name, entry] of Object.entries(value)) {
 		const label = `config.runnerLaunchers[${JSON.stringify(name)}]`;
 		if (!RUNNER_LAUNCHER_NAME_PATTERN.test(name)) throw new Error(`${label} has an invalid name; launcher names ${RUNNER_LAUNCHER_NAME_RULE}`);
-		if (!Array.isArray(argv) || argv.length === 0 || argv.some((arg) => typeof arg !== "string" || !arg.trim() || arg.includes("\u0000"))) {
-			throw new Error(`${label} must be a non-empty argv array of non-blank strings without NUL characters`);
+		if (Array.isArray(entry)) {
+			if (!isLauncherArgv(entry)) throw new Error(`${label} must be a non-empty argv array of non-blank strings without NUL characters`);
+			continue;
+		}
+		if (!entry || typeof entry !== "object") throw new Error(`${label} must be an argv array or an object with argv and container`);
+		const record = entry as Record<string, unknown>;
+		for (const key of Object.keys(record)) if (key !== "argv" && key !== "container") throw new Error(`${label}.${key} is not supported`);
+		if (!isLauncherArgv(record.argv)) throw new Error(`${label}.argv must be a non-empty argv array of non-blank strings without NUL characters`);
+		if (record.container === undefined) continue;
+		const container = record.container as Record<string, unknown>;
+		if (!container || typeof container !== "object" || Array.isArray(container)) throw new Error(`${label}.container must be an object with name, stop and probe`);
+		for (const key of Object.keys(container)) if (key !== "name" && key !== "stop" && key !== "probe") throw new Error(`${label}.container.${key} is not supported`);
+		if (typeof container.name !== "string" || !container.name.includes("{runId}") || container.name.includes("\u0000")) throw new Error(`${label}.container.name must be a string containing {runId}, so each run gets its own container`);
+		if (!record.argv.some((arg) => arg.includes("{name}"))) throw new Error(`${label}.argv must use {name} so the container is started under container.name`);
+		for (const key of ["stop", "probe"] as const) {
+			if (!isLauncherArgv(container[key])) throw new Error(`${label}.container.${key} must be a non-empty argv array of non-blank strings without NUL characters`);
+			if (!(container[key] as string[]).some((arg) => arg.includes("{name}"))) throw new Error(`${label}.container.${key} must use {name}`);
 		}
 	}
 }

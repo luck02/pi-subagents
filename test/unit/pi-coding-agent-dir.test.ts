@@ -295,6 +295,26 @@ Package skill content.
 		}
 	});
 
+	it("loads container runnerLaunchers and fails closed on incomplete container lifecycles", () => {
+		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
+		const box = { argv: ["podman", "run", "--name", "{name}", "img"], container: { name: "pi-{runId}", stop: ["podman", "rm", "-f", "{name}"], probe: ["podman", "container", "exists", "{name}"] } };
+		writeFile(configPath, JSON.stringify({ runnerLaunchers: { box, bare: { argv: ["wrap"] } } }));
+		assert.deepEqual(loadConfig().runnerLaunchers, { box, bare: { argv: ["wrap"] } });
+		const invalid: Array<[unknown, RegExp]> = [
+			[{ ...box, extra: true }, /box"\]\.extra is not supported/],
+			[{ argv: [] }, /\.argv must be a non-empty argv array/],
+			[{ ...box, container: { ...box.container, name: "pi-fixed" } }, /container\.name must be a string containing \{runId\}/],
+			[{ ...box, argv: ["podman", "run", "img"] }, /\.argv must use \{name\}/],
+			[{ ...box, container: { ...box.container, stop: [] } }, /container\.stop must be a non-empty argv array/],
+			[{ ...box, container: { ...box.container, probe: ["podman", "ps"] } }, /container\.probe must use \{name\}/],
+			[{ ...box, container: { ...box.container, kill: ["x"] } }, /container\.kill is not supported/],
+		];
+		for (const [entry, message] of invalid) {
+			writeFile(configPath, JSON.stringify({ runnerLaunchers: { box: entry } }));
+			assert.throws(() => loadConfig(), message);
+		}
+	});
+
 	it("fails config load for invalid scheduledRuns because it controls the tool schema", () => {
 		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
 		writeFile(configPath, JSON.stringify({ scheduledRuns: { enabled: "false" } }));

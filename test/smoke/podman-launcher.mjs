@@ -5,7 +5,7 @@
 // Usage: node test/smoke/podman-launcher.mjs <image> <pi-subagents entry> <out dir> [variant ...]
 //   <image>              runner image with a POSIX shell (node comes from the host mount)
 //   <pi-subagents entry> index.ts of a checkout or index.js of an installed package
-//   variants             any of: legacy, host-pid (default: both)
+//   variants             any of: legacy, host-pid, container (default: all)
 // Each case uses a faux provider, so no model is called.
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
@@ -17,13 +17,16 @@ assert.ok(image && entryArg && outArg, "usage: podman-launcher.mjs <image> <pi-s
 const entry = path.resolve(entryArg);
 const out = path.resolve(outArg);
 assert.ok(fs.existsSync(entry), `missing ${entry}`);
-const variants = variantArgs.length ? variantArgs : ["legacy", "host-pid"];
+const variants = variantArgs.length ? variantArgs : ["legacy", "host-pid", "container"];
 const cases = (process.env.SMOKE_CASES ?? "finish,runner-kill,client-kill,container-kill").split(",");
 const piCli = fs.realpathSync(spawnSync("sh", ["-c", "command -v pi"], { encoding: "utf8" }).stdout.trim());
 const piRoot = piCli.slice(0, piCli.lastIndexOf("/dist/"));
 const nodeRoot = path.dirname(path.dirname(process.execPath));
 const subagentsRoot = path.dirname(entry);
-const packagesRoot = path.dirname(subagentsRoot);
+// An installed package resolves its dependencies from the node_modules it sits in; a checkout from its own.
+const codeMounts = entry.endsWith(".ts")
+	? [subagentsRoot, ...(fs.existsSync(path.join(subagentsRoot, "node_modules")) ? [fs.realpathSync(path.join(subagentsRoot, "node_modules"))] : [])]
+	: [path.dirname(subagentsRoot)];
 const providerSource = new URL("./podman-launcher/provider.ts", import.meta.url).pathname;
 fs.mkdirSync(out, { recursive: true });
 
@@ -52,19 +55,27 @@ function podmanClientPid(name) {
 function launcherArgv(variant, name, stage) {
 	const mount = (dir, mode) => ["-v", `${dir}:${dir}:${mode},z`];
 	const common = ["podman", "run", "--rm", "--name", name, "--memory=2g", "--userns=keep-id", "-w", path.join(stage, "work"),
-		...mount(stage, "rw"), ...mount(nodeRoot, "ro"), ...mount(piRoot, "ro"), ...mount(packagesRoot, "ro")];
+		...mount(stage, "rw"), ...mount(nodeRoot, "ro"), ...mount(piRoot, "ro"), ...codeMounts.flatMap((dir) => mount(dir, "ro"))];
 	// legacy: the shape of the podman8g launcher on 2026-10-15 (own pid namespace, no env passthrough).
 	if (variant === "legacy") return [...common, "-e", `HOME=${path.join(stage, "home")}`, "-e", `SMOKE_STAGE=${stage}`, "-e", `PI_CODING_AGENT_DIR=${path.join(stage, "agent")}`, "-e", `PI_SUBAGENTS_TEMP_ROOT=${path.join(stage, "tmproot")}`, image];
 	// host-pid: share the host pid namespace and hostname, and pass the runner env through as docs/agents.md requires.
 	if (variant === "host-pid") return [...common, "--pid=host", "--uts=host", "-e", "PI_*", "-e", "JITI_ALIAS", "-e", "HOME", "-e", "PATH", "-e", "TMPDIR", "-e", "SMOKE_STAGE", image];
+	// container: own pid namespace, env passed through, and pi-subagents' container mode tracks the container by name.
+	if (variant === "container") return [...common.map((arg) => arg === name ? "{name}" : arg), "-e", "PI_*", "-e", "JITI_ALIAS", "-e", "HOME", "-e", "PATH", "-e", "TMPDIR", "-e", "SMOKE_STAGE", image];
 	throw new Error(`unknown variant ${variant}`);
+}
+
+function launcherEntry(variant, name, stage) {
+	const argv = launcherArgv(variant, name, stage);
+	if (variant !== "container") return argv;
+	return { argv, container: { name: `${name}-{runId}`, stop: ["podman", "rm", "-f", "-i", "-t", "5", "{name}"], probe: ["podman", "container", "exists", "{name}"] } };
 }
 
 function writeStage(stage, variant, name) {
 	for (const dir of ["agent/extensions/subagent", "home", "tmproot", "work/.pi/agents"]) fs.mkdirSync(path.join(stage, dir), { recursive: true });
 	fs.copyFileSync(providerSource, path.join(stage, "provider.ts"));
 	fs.writeFileSync(path.join(stage, "agent/settings.json"), JSON.stringify({ defaultProvider: "podman-smoke", defaultModel: "local", packages: [] }));
-	fs.writeFileSync(path.join(stage, "agent/extensions/subagent/config.json"), JSON.stringify({ maxActiveAsyncRunsPerSession: 5, runnerLaunchers: { smoke: launcherArgv(variant, name, stage) } }, null, 2));
+	fs.writeFileSync(path.join(stage, "agent/extensions/subagent/config.json"), JSON.stringify({ maxActiveAsyncRunsPerSession: 5, runnerLaunchers: { smoke: launcherEntry(variant, name, stage) } }, null, 2));
 	fs.writeFileSync(path.join(stage, "work/.pi/agents/podman-smoke.md"), `---\nname: podman-smoke\ndescription: Podman launcher smoke child\nmodel: podman-smoke/local\nlauncher: smoke\ntools:\nextensions:\n  - ${path.join(stage, "provider.ts")}\n---\nReturn the scripted response.\n`);
 	fs.writeFileSync(path.join(stage, "parent.ts"), `import fs from "node:fs";
 import registerSubagents from ${JSON.stringify(entry)};
@@ -126,19 +137,22 @@ async function runCase(variant, kase) {
 			return report;
 		}
 		const status0 = readJson(statusPath);
+		// Container mode names the container per run; read the bound name back from the run's status.
+		const containerName = status0?.launcher?.container?.name ?? name;
 		report.child = { ...request, statusPid: status0?.pid, statusPidNamespaceScope: status0?.pidNamespaceScope, hostPidNamespace: fs.readlinkSync("/proc/self/ns/pid") };
 		note("child-in-request", { slots: slotDirs(stage) });
-		const clientPid = podmanClientPid(name);
+		const clientPid = podmanClientPid(containerName);
 		if (kase === "finish") fs.writeFileSync(path.join(stage, "release"), "go");
 		if (kase === "runner-kill") {
-			// The runner's own pid as the host sees it; in the legacy variant the recorded pid is 1 in the container namespace.
-			const hostPid = report.child.statusPidNamespaceScope === report.child.hostPidNamespace ? status0.pid : undefined;
-			if (hostPid) process.kill(hostPid, "SIGKILL");
-			else spawnSync("podman", ["exec", name, "kill", "-9", "1"]);
-			note("runner-killed", { via: hostPid ? `host pid ${hostPid}` : "podman exec kill -9 1" });
+			// The runner's pid as the host sees it. Inside its own namespace the runner is pid 1, which ignores SIGKILL from within.
+			const hostPid = report.child.statusPidNamespaceScope === report.child.hostPidNamespace
+				? status0.pid
+				: Number(spawnSync("podman", ["inspect", "--format", "{{.State.Pid}}", containerName], { encoding: "utf8" }).stdout.trim());
+			process.kill(hostPid, "SIGKILL");
+			note("runner-killed", { hostPid });
 		}
 		if (kase === "client-kill") { process.kill(clientPid, "SIGKILL"); note("client-killed", { clientPid }); }
-		if (kase === "container-kill") { spawnSync("podman", ["kill", name]); note("container-killed"); }
+		if (kase === "container-kill") { spawnSync("podman", ["kill", containerName]); note("container-killed"); }
 		const deadline = Date.now() + 45_000;
 		let released = false;
 		let last = {};
@@ -146,7 +160,7 @@ async function runCase(variant, kase) {
 			const status = readJson(statusPath);
 			const proof = readJson(path.join(asyncDir, "process-terminal.json"));
 			const notices = readLines(path.join(stage, "parent.jsonl")).filter((line) => line.event === "sendMessage");
-			const now = { state: status?.state, proof: proof?.state, notices: notices.length, slots: slotDirs(stage).length, container: containerRunning(name), runnerAlive: report.child.statusPidNamespaceScope === report.child.hostPidNamespace ? alive(status0.pid) : undefined };
+			const now = { state: status?.state, proof: proof?.state, notices: notices.length, slots: slotDirs(stage).length, container: containerRunning(containerName), runnerAlive: report.child.statusPidNamespaceScope === report.child.hostPidNamespace ? alive(status0.pid) : undefined };
 			if (JSON.stringify(now) !== JSON.stringify(last)) { note("observed", now); last = now; }
 			// After a client kill the runner should keep going; release it once that is established.
 			if (kase === "client-kill" && !released && at() > 10_000) { fs.writeFileSync(path.join(stage, "release"), "go"); released = true; note("released"); }
@@ -162,7 +176,7 @@ async function runCase(variant, kase) {
 		fs.writeFileSync(path.join(stage, "parent-exit"), "1");
 		await Promise.race([new Promise((resolve) => parent.once("exit", resolve)), sleep(5000)]);
 		if (parent.exitCode === null) parent.kill("SIGKILL");
-		spawnSync("podman", ["rm", "-f", "-t", "0", name], { stdio: "ignore" });
+		for (const container of spawnSync("podman", ["ps", "-a", "--filter", `name=^${name}`, "--format", "{{.Names}}"], { encoding: "utf8" }).stdout.split("\n").filter(Boolean)) spawnSync("podman", ["rm", "-f", "-t", "0", container], { stdio: "ignore" });
 	}
 }
 
